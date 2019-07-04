@@ -1,5 +1,7 @@
 # Sykube
 
+[![CircleCI](https://circleci.com/gh/sylabs/sykube/tree/master.svg?style=svg)](https://circleci.com/gh/sylabs/sykube/tree/master)
+
 Sykube is inspired by [Minikube](https://kubernetes.io/docs/setup/learning-environment/minikube/) and allows
 to quickly deploy a localized multi-node K8S cluster (2 nodes by default) on a single machine. The K8S cluster
 is setup with the help of [Singularity-CRI](https://github.com/sylabs/singularity-cri) and
