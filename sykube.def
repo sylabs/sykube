@@ -1,0 +1,253 @@
+#
+# Sykube image
+#
+
+Bootstrap: docker
+From: ubuntu:xenial
+
+%environment
+    export PATH=/opt/go/bin:$PATH
+    export GOPATH=/opt/gopath
+    export KUBECONFIG=/etc/kubernetes/admin.conf
+    
+%setup
+    mkdir $SINGULARITY_ROOTFS/etc/sykube
+    cp --preserve=mode sykube $SINGULARITY_ROOTFS/etc/sykube
+    cat > $SINGULARITY_ROOTFS/etc/hosts <<EOF
+127.0.0.1   localhost
+
+::1     localhost ip6-localhost ip6-loopback
+ff02::1 ip6-allnodes
+ff02::2 ip6-allrouters
+EOF
+
+%post
+    apt-get update -y && apt-get install -y --no-install-recommends apt-transport-https ca-certificates curl software-properties-common gnupg2 lsb-release wget
+    curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
+    echo "deb http://apt.kubernetes.io/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
+    apt-get update -y
+    apt-get install -y --no-install-recommends supervisor iproute2 iputils-ping ethtool ebtables kmod
+    apt-get install -y --no-install-recommends kubelet=1.14.1-00 kubectl=1.14.1-00 kubeadm=1.14.1-00
+    apt-get install -y --no-install-recommends squashfs-tools libssl-dev uuid-dev libseccomp-dev libseccomp2
+    apt-get install -y --no-install-recommends gcc make git pkg-config less
+
+    rm -rf /var/log/*
+
+    mkdir /etc/supervisor/available.d/
+
+    cat > /etc/supervisor/available.d/singularity-cri.conf <<EOF
+[program:cri]
+command=/usr/local/bin/sycri -v=10
+priority=10
+autostart=true
+startsecs=1
+autorestart=true
+stdout_logfile=/var/log/singularity-cri.out
+stderr_logfile=/var/log/singularity-cri.err
+environment=PATH="/usr/local/libexec/singularity/bin:/bin:/sbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
+EOF
+    ln -s /etc/supervisor/available.d/singularity-cri.conf /etc/supervisor/conf.d/singularity-cri.conf
+
+    cat > /etc/supervisor/available.d/kubelet.conf <<EOF
+[program:kubelet]
+priority=100
+command=/usr/bin/kubelet-wrapper
+autostart=true
+startsecs=10
+startretries=360
+autorestart=true
+stdout_logfile=/var/log/kubelet.out
+stderr_logfile=/var/log/kubelet.err
+EOF
+    ln -s /etc/supervisor/available.d/kubelet.conf /etc/supervisor/conf.d/kubelet.conf
+
+    cat > /etc/supervisor/available.d/kube-proxy.conf <<EOF
+[program:kube-proxy]
+command=/usr/bin/kube-proxy-wrapper
+autostart=true
+startsecs=10
+startretries=360
+autorestart=true
+stdout_logfile=/var/log/kube-proxy.out
+stderr_logfile=/var/log/kube-proxy.err
+EOF
+
+    cat > /usr/bin/kube-proxy-wrapper <<EOF
+#!/bin/sh
+
+if [ -f "/etc/kubernetes/admin.conf" ]; then
+    export KUBECONFIG="/etc/kubernetes/admin.conf"
+    exec /usr/bin/kubectl proxy --address=10.11.11.2
+fi
+
+exit 1
+EOF
+    chmod 755 /usr/bin/kube-proxy-wrapper
+
+    cat > /usr/bin/kubelet-wrapper <<EOF
+#!/bin/sh
+
+KUBELET_EXTRA_ARGS="--container-runtime=remote --container-runtime-endpoint=/var/run/singularity.sock --image-service-endpoint=/var/run/singularity.sock --fail-swap-on=false"
+KUBELET_KUBECONFIG_ARGS="--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf"
+KUBELET_CONFIG_ARGS="--config=/var/lib/kubelet/config.yaml"
+
+exec /usr/bin/kubelet \$KUBELET_KUBECONFIG_ARGS \$KUBELET_CONFIG_ARGS \$KUBELET_EXTRA_ARGS
+EOF
+    chmod 755 /usr/bin/kubelet-wrapper
+
+    cat > /usr/bin/service-sup <<EOF
+#!/bin/sh
+
+case "\$1" in
+    disable)
+        if [ -f "/etc/supervisor/conf.d/\$2.conf" ]; then
+            rm /etc/supervisor/conf.d/\$2.conf
+            supervisorctl update
+        else
+            echo "no service found for \$2"
+            exit 1
+        fi
+    ;;
+    enable)
+        if [ -f "/etc/supervisor/available.d/\$2.conf" ]; then
+            ln -s /etc/supervisor/available.d/\$2.conf /etc/supervisor/conf.d/\$2.conf
+            supervisorctl update
+        else
+            echo "no service found for \$2"
+            exit 1
+        fi
+    ;;
+    *)
+        echo "usage service-sup enable|disable service"
+        exit 1
+    ;;
+esac
+EOF
+    chmod 755 /usr/bin/service-sup
+
+    curl https://dl.google.com/go/go1.12.1.linux-amd64.tar.gz | tar -C /opt -xz
+    export PATH=/opt/go/bin:$PATH
+    export GOPATH=/opt/gopath
+
+    mkdir -p /opt/gopath
+    cd /opt
+
+    git clone https://github.com/sylabs/singularity-cri -b v1.0.0-beta.2
+    git clone https://github.com/sylabs/singularity -b v3.3.0-rc.1
+
+    export HOME=/tmp
+
+    cd /opt/singularity-cri
+    make && make install
+
+    cd /opt/singularity
+    ./mconfig
+    make -C builddir
+    make -C builddir install
+
+    unset HOME
+
+    cat > /etc/sykube/kubeadm.yml <<EOF
+apiVersion: kubeadm.k8s.io/v1beta1
+kind: InitConfiguration
+nodeRegistration:
+  criSocket: /var/run/singularity.sock
+---
+apiVersion: kubeadm.k8s.io/v1beta1
+kind: ClusterConfiguration
+kubernetesVersion: v1.14.1
+networking:
+  podSubnet: 10.244.0.0/16
+---
+apiVersion: kubeadm.k8s.io/v1beta1
+kind: JoinConfiguration
+nodeRegistration:
+  criSocket: /var/run/singularity.sock
+EOF
+
+    cat > /etc/sykube/admin-user.yml <<EOF
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: admin-user
+  namespace: kube-system
+EOF
+
+    cat > /etc/sykube/admin-role.yml <<EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: admin-user
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: admin-user
+  namespace: kube-system
+EOF
+
+    mkdir -p /etc/cni/net.d
+
+    apt-get clean
+    apt-get autoclean
+
+    cat > /etc/cni/net.d/00_bridge.conflist <<EOF
+{
+    "cniVersion": "0.3.1",
+    "name": "bridge",
+    "plugins": [
+        {
+            "type": "loopback"
+        },
+        {
+            "type": "bridge",
+            "bridge": "cbr0",
+            "isGateway": true,
+            "isDefaultGateway": true,
+            "ipMasq": true,
+            "capabilities": {"ipRanges": true},
+            "ipam": {
+                "type": "host-local",
+                "routes": [
+                    {
+                        "dst": "0.0.0.0/0"
+                    }
+                ]
+            }
+        },
+        {
+            "type": "portmap",
+            "capabilities": {"portMappings": true},
+            "snat": true
+        }
+    ]
+}
+EOF
+
+%startscript
+    mount -t tmpfs tmpfs -o nosuid,nodev,mode=755 /run
+    mkdir /run/lock
+    mkdir /run/flannel
+    mount -t tmpfs tmpfs -o nosuid,nodev,noexec,relatime,size=5120k /run/lock
+    mount --make-rshared /
+    mkdir -p /var/log/supervisor 
+    exec supervisord
+
+%runscript
+    for p in `pgrep --ns $$ -v`; do
+        if ls -la /proc/$p/root/lib/modules/`uname -r` >/dev/null 2>&1; then
+            break
+        fi
+    done
+    dest=`realpath --relative-base="/proc/$p/root" "/usr/local/bin" 2>/dev/null`
+    if [ ! -z "${dest}" ]; then
+        if cp --preserve=mode /etc/sykube/sykube "/proc/$p/root/${dest}/sykube"; then
+            echo "sykube is now installed in ${dest}"
+            exit
+        fi
+    else
+        echo "could not install sykube in /usr/local/bin"
+    fi
+    exit 1

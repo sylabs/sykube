@@ -1,0 +1,118 @@
+version: 2
+
+defaults: &defaults
+  working_directory: /tmp/ci/sykube
+  docker:
+    - image: golang:1.12-stretch
+
+jobs:
+  get_source:
+    <<: *defaults
+    steps:
+      - checkout
+      - persist_to_workspace:
+          root: /tmp/ci
+          paths:
+            - sykube
+
+  install_sykube:
+    machine: true
+    working_directory: /tmp/ci/sykube
+    steps:
+      - attach_workspace:
+          at: /tmp/ci
+      - run:
+          name: Update go to 1.12
+          command: |
+            wget https://dl.google.com/go/go1.12.linux-amd64.tar.gz
+            sudo tar -C /usr/lib -xzf go1.12.linux-amd64.tar.gz
+      - run:
+          name: Install dev libraries
+          command: |
+            sudo apt-get update -y
+            sudo apt-get install -y build-essential libssl-dev uuid-dev squashfs-tools libseccomp-dev libgpgme11-dev
+      - run:
+          name: Install singularity
+          command: |
+            export PATH=/usr/lib/go/bin:$PATH
+            git clone https://github.com/sylabs/singularity.git
+            cd singularity
+            ./mconfig -p /tmp/ci/sykube/sinstall
+            make -C ./builddir
+            sudo make -C ./builddir install
+      - run:
+          name: Build sykube image
+          command: |
+            sudo /tmp/ci/sykube/sinstall/bin/singularity build sykube.sif sykube.def
+      - run:
+          name: Test sykube deployment
+          command: |
+            export PATH=/tmp/ci/sykube/sinstall/bin:$PATH
+            sudo /tmp/ci/sykube/sinstall/bin/singularity run sykube.sif
+            sykube init --local-image sykube.sif
+      - persist_to_workspace:
+          root: /tmp/ci
+          paths:
+            - sykube/sinstall
+            - sykube/sykube.sif
+
+  publish_sykube:
+    machine: true
+    steps:
+      - attach_workspace:
+          at: /tmp/ci
+      - run:
+          name: Install prerequisities
+          command: |
+            sudo apt-get update -y
+            sudo apt-get install -y expect libseccomp-dev libssl-dev uuid-dev libgpgme11-dev
+      - run:
+          name: Publish Sykube image
+          working_directory: /tmp/ci/sykube
+          command: |
+            TAG=latest
+            if [ ! -z "${CIRCLE_TAG}" ]; then
+                TAG=${CIRCLE_TAG}
+            fi
+            export PATH=/tmp/ci/sykube/sinstall/bin:$PATH
+            mkdir ~/.singularity
+            touch ~/.singularity/remote.yaml
+            echo $CLOUD_AUTH_TOKEN > token
+            singularity remote login --tokenfile token SylabsCloud
+            echo $SYLABS_PRIVKEY_BASE64 | base64 -d - > key
+            cat > import_sign.cmd <<EOF
+            #!/usr/bin/expect -f
+            set timeout -1
+            spawn singularity keys import key
+            expect "Enter your old password : "
+            send -- "\r"
+            expect "Enter a new password for this key : "
+            send -- "\r"
+            expect "Retype your passphrase : "
+            send -- "\r"
+            expect eof
+            spawn singularity sign sykube.sif
+            expect "Enter key passphrase : "
+            send -- "\r"
+            expect eof
+            EOF
+            expect import_sign.cmd
+            singularity push sykube.sif library://library/default/sykube:$TAG
+
+workflows:
+  version: 2
+  build_and_test:
+    jobs:
+      - get_source
+      - install_sykube:
+          requires:
+            - get_source
+      - publish_sykube:
+          requires:
+            - install_sykube
+          filters:
+            tags:
+              only: /.*/
+            branches:
+              only:
+                - master

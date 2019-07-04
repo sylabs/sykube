@@ -1,0 +1,602 @@
+#!/bin/sh
+#
+# Copyright (c) 2019, Sylabs Inc. All rights reserved.
+# This software is licensed under a 3-clause BSD license. Please consult the
+# LICENSE.md file distributed with the sources of this project regarding your
+# rights to use or distribute this software.
+#
+
+SYKUBE_NODES="1"
+
+SYKUBE_URL="library://sykube"
+SYKUBE_DIR="/var/lib/sykube"
+SYKUBE_IMAGE_DIR="/var/lib/sykube-image"
+SYKUBE_BOOTSTRAP_FILE="${SYKUBE_DIR}/bootstrap"
+SYKUBE_IMAGE="${SYKUBE_IMAGE_DIR}/sykube.sif"
+SYKUBE_NODES_DIR="${SYKUBE_DIR}/nodes"
+SYKUBE_LOG="${SYKUBE_DIR}/bootstrap.log"
+SYKUBE_DNS="${SYKUBE_DIR}/dns"
+SYKUBE_VOLUMES="${SYKUBE_DIR}/volumes"
+SYKUBE_FINAL_DIR=""
+
+MASTER_NAME="sykube-master"
+MASTER_DIR="${SYKUBE_DIR}/${MASTER_NAME}"
+MASTER_OVERLAY="${MASTER_DIR}/overlay"
+MASTER_SINGULARITY="${MASTER_DIR}/singularity"
+MASTER_IP="10.11.11.2"
+
+NODE_JOIN_CMD=""
+NODE_PREFIX="sykube-node"
+
+NETWORK_CONF_DIR="/usr/local/etc/singularity/network"
+NETWORK_CONF_FILE="99_sykube.conflist"
+
+SINGULARITY_OPTIONS=""
+
+if [ -f "${SYKUBE_BOOTSTRAP_FILE}" ]; then
+    . "${SYKUBE_BOOTSTRAP_FILE}"
+fi
+
+if [ -z "${NAMESERVER}" ]; then
+    NAMESERVER="1.1.1.1"
+fi
+
+fatal() {
+    echo "[-] $1"
+    if [ ! -f "${SYKUBE_BOOTSTRAP_FILE}" -a -f "${SYKUBE_LOG}" ]; then
+        echo
+        echo "--------------- LOGS -----------------"
+        cat "${SYKUBE_LOG}"
+        echo "--------------------------------------"
+        echo
+    fi
+    exit 1
+}
+
+singularity=`which singularity`
+if [ -z "${singularity}" ]; then
+    fatal "Sykube requires Singularity V3, or check if singularity binary is in your PATH"
+fi
+
+SINGULARITY_CONF_DIR=`singularity buildcfg 2>/dev/null| grep SYSCONFDIR | cut -d '=' -f 2`
+if [ ! -z "${SINGULARITY_CONF_DIR}" ]; then
+    NETWORK_CONF_DIR="${SINGULARITY_CONF_DIR}/singularity/network"
+fi
+
+SINGULARITY_LIBEXEC_DIR=`singularity buildcfg 2>/dev/null| grep LIBEXECDIR | cut -d '=' -f 2`
+SINGULARITY_CNI_FIREWALL=0
+if [ -f "${SINGULARITY_LIBEXEC_DIR}/singularity/cni/firewall" ]; then
+    SINGULARITY_CNI_FIREWALL=1
+fi
+
+run_as_root() {
+    if [ `id -u` != "0" ]; then
+        sudo=`which sudo 2>/dev/null`
+        if [ -z "${sudo}" ]; then
+            fatal "sudo not found, sykube require root privileges"
+        fi
+        exec ${sudo} PATH=$PATH $0 "$@"
+    fi
+}
+
+set_node() {
+    NODE_NAME="$1"
+    NODE_DIR="${SYKUBE_NODES_DIR}/${NODE_NAME}"
+    NODE_OVERLAY="${NODE_DIR}/overlay"
+    NODE_SINGULARITY="${NODE_DIR}/singularity"
+    NODE_NUM=`echo $1 | tr -dc '0-9'`
+    NODE_IP="10.11.11.`expr 2 + ${NODE_NUM}`"
+}
+
+inject() {
+    stty -echo
+    perl -e 'ioctl(STDIN, 0x5412, $_) for split "", join " ", @ARGV' `printf "$@\r\n"` >/dev/null 2>&1
+    stty echo
+}
+
+inject_kubectl() {
+    if tty >/dev/null 2>&1; then
+        print "Injecting kubectl alias"
+        inject "alias kubectl=\"sudo ${singularity} exec instance://${MASTER_NAME} kubectl\""
+    fi
+}
+
+print() {
+    echo "[+] $1"
+}
+
+print_cmd() {
+    echo "[+] $1"
+    shift
+    "$@" >> ${SYKUBE_LOG} 2>&1
+    if [ $? != 0 ]; then
+        fatal "Error while executing $@"
+    fi
+}
+
+write_network_config() {
+    net_config_file="${NETWORK_CONF_DIR}/${NETWORK_CONF_FILE}"
+
+    if [ ${SINGULARITY_CNI_FIREWALL} -eq 0 ]; then
+        cat > $net_config_file <<EOF
+{
+    "cniVersion": "0.3.1",
+    "name": "sykube",
+    "plugins": [
+        {
+            "type": "bridge",
+            "bridge": "sk0",
+            "isGateway": true,
+            "ipMasq": true,
+            "ipam": {
+                "type": "host-local",
+                "subnet": "10.11.11.0/24",
+                "routes": [
+                    { "dst": "0.0.0.0/0" }
+                ]
+            }
+        },
+        {
+            "type": "portmap",
+            "capabilities": {"portMappings": true},
+            "snat": true
+        }
+    ]
+}
+EOF
+    else
+        cat > $net_config_file <<EOF
+{
+    "cniVersion": "0.4.0",
+    "name": "sykube",
+    "plugins": [
+        {
+            "type": "bridge",
+            "bridge": "sk0",
+            "isGateway": true,
+            "ipMasq": true,
+            "ipam": {
+                "type": "host-local",
+                "subnet": "10.11.11.0/24",
+                "routes": [
+                    { "dst": "0.0.0.0/0" }
+                ]
+            }
+        },
+        {
+            "type": "firewall"
+        },
+        {
+            "type": "portmap",
+            "capabilities": {"portMappings": true},
+            "snat": true
+        }
+    ]
+}
+EOF
+    fi
+}
+
+set_iptables_rules() {
+    if ! command -v iptables >/dev/null 2>&1; then
+        fatal "iptables command not found"
+    fi
+
+    if ! iptables --check FORWARD -j CNI-FORWARD >/dev/null 2>&1; then
+        iptables -N CNI-FORWARD 2>${SYKUBE_LOG}
+        iptables -I FORWARD 1 -j CNI-FORWARD 2>${SYKUBE_LOG}
+        iptables -A CNI-FORWARD -o sk0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>${SYKUBE_LOG}
+        iptables -A CNI-FORWARD -i sk0 -j ACCEPT 2>${SYKUBE_LOG}
+    fi
+}
+
+wait_until() {
+    timeout=$1
+    while [ $timeout != "0" ]; do
+        singularity exec instance://$2 pgrep "$3" 2>/dev/null
+        if [ $? = 0 ]; then
+            break
+        else
+            timeout=`expr $timeout - 1`
+            sleep 1
+        fi
+    done 
+    if [ $timeout = 0 ]; then
+        fatal "Timeout reached while waiting $3"
+    fi
+}
+
+wait_services() {
+    wait_until 300 ${MASTER_NAME} flanneld
+    wait_until 60 ${MASTER_NAME} dashboard
+}
+
+create_all_dir() {
+    mkdir -p ${MASTER_OVERLAY} ${MASTER_SINGULARITY}
+    for i in $(seq ${SYKUBE_NODES}); do
+        set_node "${NODE_PREFIX}$i"
+        mkdir -p ${NODE_OVERLAY} ${NODE_SINGULARITY}
+    done
+}
+
+check_cluster() {
+    if [ ! -f "${SYKUBE_BOOTSTRAP_FILE}" ]; then
+        fatal "No kubernetes cluster found"
+    fi
+}
+
+get_sykube_image() {
+    mkdir -p ${SYKUBE_IMAGE_DIR} 2>/dev/null
+    if [ -z "${SYKUBE_LOCAL_IMAGE}" ]; then
+        print_cmd "Downloading Sykube image to ${SYKUBE_IMAGE}" singularity -s pull -F ${SYKUBE_IMAGE} ${SYKUBE_URL}
+    else
+        print_cmd "Copying Sykube ${SYKUBE_LOCAL_IMAGE} image to ${SYKUBE_IMAGE}" cp ${SYKUBE_LOCAL_IMAGE} ${SYKUBE_IMAGE}
+    fi
+}
+
+start_master() {
+    print_cmd "Starting master node" singularity instance start \
+                                    -o ${MASTER_OVERLAY} \
+                                    -B ${MASTER_SINGULARITY}:/var/lib/singularity \
+                                    -B /boot:/boot:ro \
+                                    -B /lib/modules:/lib/modules:ro \
+                                    -B ${SYKUBE_VOLUMES}:/volumes \
+                                    -B /sys/fs/cgroup \
+                                    --net \
+                                    --dns=${NAMESERVER} \
+                                    --hostname=${MASTER_NAME} \
+                                    --network=sykube \
+                                    --network-args="IP=${MASTER_IP};portmap=8001:8001/tcp" \
+                                    --keep-privs \
+                                    ${SINGULARITY_OPTIONS} \
+                                    ${SYKUBE_IMAGE} \
+                                    ${MASTER_NAME}
+}
+
+bootstrap_master() {
+    print_cmd "Add ${MASTER_NAME} to /etc/hosts" singularity exec instance://${MASTER_NAME} /bin/sh -c "echo '${MASTER_IP} ${MASTER_NAME}.cluster.local ${MASTER_NAME}' >> /etc/hosts"
+    print_cmd "Running kubeadm ${MASTER_NAME}" singularity exec instance://${MASTER_NAME} kubeadm init --config=/etc/sykube/kubeadm.yml --ignore-preflight-errors=all
+    if [ $? != 0 ]; then
+        fatal "Failed to bootstrap master node"
+    fi
+    print_cmd "Install flannel" singularity exec instance://${MASTER_NAME} kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml
+    print_cmd "Create admin-user" singularity exec instance://${MASTER_NAME} kubectl apply -f /etc/sykube/admin-user.yml
+    print_cmd "Create admin_user role" singularity exec instance://${MASTER_NAME} kubectl apply -f /etc/sykube/admin-role.yml
+    print_cmd "Install dashboard" singularity exec instance://${MASTER_NAME} kubectl apply -f https://raw.githubusercontent.com/kubernetes/dashboard/v1.10.1/src/deploy/recommended/kubernetes-dashboard.yaml
+    print_cmd "Waiting flannel and dashboard services" wait_services
+    print_cmd "Enabling kube-proxy service" singularity exec instance://${MASTER_NAME} service-sup enable kube-proxy
+    NODE_JOIN_CMD=`singularity -s exec instance://${MASTER_NAME} kubeadm token create --print-join-command 2>/dev/null`
+    if [ -z "${NODE_JOIN_CMD}" ]; then
+        fatal "Failed to retrieve kubeadm join token"
+    fi
+}
+
+stop_master() {
+    singularity instance list | grep ${MASTER_NAME} >/dev/null
+    if [ $? = 0 ]; then
+        print_cmd "Stopping master node" singularity instance stop -t 5 ${MASTER_NAME}
+    fi
+}
+
+start_node() {
+    set_node "$1"
+    print_cmd "Starting ${NODE_NAME}" singularity instance start \
+                                     -o ${NODE_OVERLAY} \
+                                     -B ${NODE_SINGULARITY}:/var/lib/singularity \
+                                     -B /boot:/boot:ro \
+                                     -B /lib/modules:/lib/modules:ro \
+                                     -B ${SYKUBE_VOLUMES}:/volumes \
+                                     -B /sys/fs/cgroup \
+                                     --net \
+                                     --network=sykube \
+                                     --network-args="IP=${NODE_IP}" \
+                                     --dns=${NAMESERVER} \
+                                     --hostname=${NODE_NAME} \
+                                     --keep-privs \
+                                     ${SINGULARITY_OPTIONS} \
+                                     ${SYKUBE_IMAGE} \
+                                     ${NODE_NAME}
+}
+
+bootstrap_node() {
+    set_node "$1"
+    print_cmd "Add ${NODE_NAME} to /etc/hosts (${NODE_NAME})" singularity exec instance://${NODE_NAME} /bin/sh -c "echo '${NODE_IP} ${NODE_NAME}.cluster.local ${NODE_NAME}' >> /etc/hosts"
+    print_cmd "Add ${NODE_NAME} to /etc/hosts (${MASTER_NAME})" singularity exec instance://${MASTER_NAME} /bin/sh -c "echo '${NODE_IP} ${NODE_NAME}.cluster.local ${NODE_NAME}' >> /etc/hosts"
+    print_cmd "Running kubeadm on ${NODE_NAME}" singularity exec instance://${NODE_NAME} ${NODE_JOIN_CMD} --ignore-preflight-errors=all
+    if [ $? != 0 ]; then
+        fatal "Failed to bootstrap node ${NODE_NAME}"
+    fi
+}
+
+stop_node() {
+    set_node "$1"
+    singularity instance list | grep ${NODE_NAME} >/dev/null
+    if [ $? = 0 ]; then
+        print_cmd "Stopping ${NODE_NAME}" singularity instance stop -t 5 ${NODE_NAME}
+    fi
+}
+
+sykube_preinit() {
+    if [ -d "/var/lib/cni/networks/sykube" ]; then
+        rm -rf /var/lib/cni/networks/sykube 2>/dev/null
+    fi
+    if ! lsmod | grep "br_netfilter" >/dev/null 2>&1; then
+        print_cmd "Load br_netfilter module" modprobe br_netfilter
+    fi
+    if ! lsmod | grep "nf_conntrack" >/dev/null 2>&1; then
+        print_cmd "Load nf_conntrack modules" modprobe nf_conntrack
+    fi
+    t=`cat /proc/sys/net/bridge/bridge-nf-call-iptables 2>/dev/null`
+    if [ "$t" = "0" ]; then
+        print_cmd "Set iptables bridge" /bin/sh -c "echo 1 > /proc/sys/net/bridge/bridge-nf-call-iptables"
+    fi
+    t=`cat /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null`
+    if [ "$t" -lt 32768 ]; then
+        print_cmd "Set nf_conntrack hashsize value to 131072" /bin/sh -c "echo 131072 > /sys/module/nf_conntrack/parameters/hashsize"
+    fi
+}
+
+sykube_init() {
+    if [ -f "${SYKUBE_BOOTSTRAP_FILE}" ]; then
+        fatal "Initialization already done, delete first"
+    fi
+
+    if [ -n "${SYKUBE_FINAL_DIR}" ]; then
+        mkdir -p ${SYKUBE_FINAL_DIR}
+        if [ -d "${SYKUBE_DIR}" ]; then
+            rm -rf ${SYKUBE_DIR} 2>/dev/null
+        fi
+        ln -s ${SYKUBE_FINAL_DIR} ${SYKUBE_DIR}
+        print_cmd "Installing sykube in ${SYKUBE_FINAL_DIR}" mkdir -p ${SYKUBE_VOLUMES}
+    else
+        mkdir -p ${SYKUBE_VOLUMES}
+        print "Installing sykube in ${SYKUBE_DIR}"
+    fi
+
+    print "Bootstrap log are available at ${SYKUBE_LOG}"
+    if [ -n "${SYKUBE_TMPFS}" ]; then
+        print_cmd "Create ephemeral storage" mount -t tmpfs sykube ${SYKUBE_DIR}
+    fi
+
+    print_cmd "Create sykube nodes directory" create_all_dir
+    print_cmd "Write network config" write_network_config
+    sykube_preinit
+
+    if [ ! -f "${SYKUBE_IMAGE}" ]; then
+        get_sykube_image
+    fi
+
+    if [ ${SINGULARITY_CNI_FIREWALL} -eq 0 ]; then
+        print_cmd "Setup iptables rules" set_iptables_rules
+    fi
+
+    start_master
+    print_cmd "Master node bootstrap" sleep 1
+    bootstrap_master
+
+    for node in `ls ${SYKUBE_NODES_DIR} 2>/dev/null`; do
+        start_node "${node}"
+        print_cmd "Node ${node} bootstrap" sleep 1
+        print_cmd "Update master /etc/hosts" singularity exec instance://${NODE_NAME} /bin/sh -c "echo '${MASTER_IP} ${MASTER_NAME}' >> /etc/hosts"
+        bootstrap_node "${node}"
+    done
+
+    print_cmd "Record DNS" /bin/sh -c "echo \"NAMESERVER=${NAMESERVER}\" > ${SYKUBE_BOOTSTRAP_FILE}"
+    print_cmd "Record network configuration path" /bin/sh -c "echo 'NETCONF=\"${NETWORK_CONF_DIR}/${NETWORK_CONF_FILE}\"' >> ${SYKUBE_BOOTSTRAP_FILE}"
+    print_cmd "Store singularity options" /bin/sh -c "echo 'SINGULARITY_OPTIONS=\"${SINGULARITY_OPTIONS}\"' >> ${SYKUBE_BOOTSTRAP_FILE}"
+    if [ -n "${SYKUBE_TMPFS}" ]; then
+        print_cmd "Mark as ephemeral" /bin/sh -c "echo \"EPHEMERAL=1\" >> ${SYKUBE_BOOTSTRAP_FILE}"
+    fi
+
+    print "Bootstrap terminated"
+}
+
+sykube_start() {
+    check_cluster
+    sykube_preinit
+    start_master
+    for node in `ls ${SYKUBE_NODES_DIR} 2>/dev/null`; do
+        start_node "${node}"
+    done
+}
+
+sykube_stop() {
+    for node in `ls ${SYKUBE_NODES_DIR} 2>/dev/null`; do
+        stop_node "${node}"
+    done
+    stop_master
+}
+
+sykube_status() {
+    if singularity exec instance://${MASTER_NAME} true >/dev/null 2>&1; then
+        echo "${MASTER_NAME} - running"
+    else
+        if [ -f "${SYKUBE_BOOTSTRAP_FILE}" ]; then
+            echo "${MASTER_NAME} - stopped"
+        fi
+    fi
+    for node in `ls ${SYKUBE_NODES_DIR} 2>/dev/null`; do
+        if singularity exec instance://${node} true >/dev/null 2>&1; then
+            echo "${node} - running"
+        else
+            if [ -f "${SYKUBE_BOOTSTRAP_FILE}" ]; then
+                echo "${node} - stopped"
+            fi
+        fi
+    done
+}
+
+sykube_delete() {
+    sykube_stop
+    if [ -f "${NETCONF}" ];then
+        print_cmd "Deleting Sykube network configuration" rm -f ${NETCONF}
+    fi
+    sleep 1
+    if [ -n "${EPHEMERAL}" ]; then
+        umount -f "${SYKUBE_DIR}" >/dev/null
+    fi
+    if [ -d "${SYKUBE_IMAGE_DIR}" ]; then
+        rm -rf ${SYKUBE_IMAGE_DIR} 2>/dev/null
+    fi
+    if [ -f "${SYKUBE_LOG}" ]; then
+        print "Deleting Sykube directory"
+        rm -rf ${SYKUBE_DIR}/* 2>/dev/null
+        if [ -L "${SYKUBE_DIR}" ]; then
+            target=`readlink ${SYKUBE_DIR}`
+            rm -rf ${target} 2>/dev/null
+            rm -f ${SYKUBE_DIR} 2>/dev/null
+        else
+            rm -rf ${SYKUBE_DIR} 2>/dev/null
+        fi
+    fi
+}
+
+sykube_dashboard() {
+    check_cluster
+    sudo=""
+    if [ `id -u` != "0" ]; then
+        sudo="sudo"
+    fi
+    secret=`${sudo} singularity exec instance://${MASTER_NAME} kubectl -n kube-system get secret 2>/dev/null | grep admin-user | awk '{print $1}'`
+    if [ -z "${secret}" ]; then
+        fatal "admin-user secret not found"
+    fi
+    token=`${sudo} singularity exec instance://${MASTER_NAME} kubectl -n kube-system describe secret ${secret}|grep "token:"|cut -d ':' -f2|tr -d ' ' 2>/dev/null`
+    if [ -z "${token}" ]; then
+        fatal "Failed to get dashboard token"
+    fi
+    echo "\nDahsboard URL:\n\nhttp://localhost:8001/api/v1/namespaces/kube-system/services/https:kubernetes-dashboard:/proxy/\n"
+    xdg=`which xdg-open 2>/dev/null`
+    if [ -n "${xdg}" ]; then
+        ${xdg} http://localhost:8001/api/v1/namespaces/kube-system/services/https:kubernetes-dashboard:/proxy/ 2>/dev/null &
+    fi
+    echo "Token:\n"
+    echo "${token}\n" && echo "${token}" | xclip -l 1 -selection c 2>/dev/null
+}
+
+sykube_shell() {
+    check_cluster
+    name="$1"
+    singularity shell instance://sykube-${name}
+}
+
+sykube_exec() {
+    check_cluster
+    name="$1"
+    shift
+    singularity exec instance://sykube-${name} "$@"
+}
+
+sykube_config() {
+    check_cluster
+    OUTPUT=`singularity exec instance://${MASTER_NAME} cat /etc/kubernetes/admin.conf 2>/dev/null`
+    if [ $? != 0 ]; then
+        fatal "Master node is not running, start first"
+    fi
+    echo "${OUTPUT}"
+}
+
+sykube_service() {
+    check_cluster
+    port=`sykube_exec "master" kubectl get --all-namespaces svc -o go-template --template="{{range .items}}{{if eq .metadata.name \"$1\"}}{{range .spec.ports}}{{.nodePort}}{{println}}{{end}}{{end}}{{end}}"`
+    if [ $? != 0 ]; then
+        fatal "Failed to retrieve service $1"
+    fi
+    for p in ${port}; do
+        echo "${MASTER_IP}:${port}"
+    done
+}
+
+sykube_update() {
+    sykube_stop
+    get_sykube_image
+    print "Updating Sykube script"
+    singularity -s run ${SYKUBE_IMAGE} >/dev/null 2>&1
+}
+
+sykube_usage() {
+    echo "usage: sykube <command>"
+    echo
+    echo "Commands available:"
+    echo
+    echo " - config:      display kubernetes config (eg: ./sykube config > ~/.kube/config)"
+    echo " - dashboard:   open dashboard and/or display token information and URL"
+    echo " - delete:      delete all Sykube files"
+    echo " - exec:        execute command inside node (eg: exec master kubectl <args>)"
+    echo " - init:        boostrap kubernetes cluster, can take options:"
+    echo "                --dest:        to specify where to store Sykube files"
+    echo "                --dns:         nameserver ip to use for node (default: ${NAMESERVER})"
+    echo "                --ephemeral:   create an ephemeral cluster on tmpfs (deleted on reboot)"
+    echo "                --network-dir: path to Singularity network configuration (default: ${NETWORK_CONF_DIR})"
+    echo "                --nodes:       number of cluster nodes (default: ${SYKUBE_NODES})"
+    echo "                --options:     to specify singularity instance options (eg: --options \"--nv\")"
+    echo "                --local-image: to use a local sykube image instead of downloading remote ${SYKUBE_URL}"
+    echo " - kubectl:     generate a kubectl alias in current shell"
+    echo " - service:     display information to reach the corresponding service"
+    echo " - shell:       open shell inside node (eg: shell master, shell node1 ...)"
+    echo " - start:       start kubernetes cluster"
+    echo " - status:      report node status"
+    echo " - stop:        stop kubernetes cluster"
+    echo " - update:      update Sykube (implying to stop cluster)"
+    echo
+    echo "Example:"
+    echo
+    echo "sykube init --network-dir /usr/local/etc/singularity/network --nodes 1"
+    echo
+}
+
+case "$1" in
+    start)
+        run_as_root "$@"
+        sykube_start ;;
+    stop)
+        run_as_root "$@"
+        sykube_stop ;;
+    delete)
+        run_as_root "$@"
+        sykube_delete ;;
+    init)
+        run_as_root "$@"
+        shift
+        while [ $# != 0 ]; do
+            case "$1" in
+                --options) SINGULARITY_OPTIONS="$2"; shift 2 ;;
+                --dest) SYKUBE_FINAL_DIR="$2"; shift 2 ;;
+                --ephemeral) SYKUBE_TMPFS=1; shift ;;
+                --network-dir) NETWORK_CONF_DIR="$2"; shift 2 ;;
+                --nodes) SYKUBE_NODES="$2"; shift 2 ;;
+                --dns) NAMESERVER="$2"; shift 2 ;;
+                --local-image) SYKUBE_LOCAL_IMAGE="$2"; shift 2 ;;
+            esac
+        done
+        sykube_init ;;
+    status)
+        run_as_root "$@"
+        sykube_status ;;
+    kubectl)
+        inject_kubectl ;;
+    dashboard)
+        sykube_dashboard ;;
+    service)
+        run_as_root "$@"
+        shift
+        sykube_service "$1" ;;
+    shell)
+        run_as_root "$@"
+        shift
+        sykube_shell "$1" ;;
+    exec)
+        run_as_root "$@"
+        shift
+        sykube_exec "$@" ;;
+    config)
+        run_as_root "$@"
+        sykube_config ;;
+    update)
+        run_as_root "$@"
+        sykube_update ;;
+    -h|--help)
+        sykube_usage ;;
+    *)
+        sykube_usage ;;
+esac
