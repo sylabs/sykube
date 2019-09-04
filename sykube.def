@@ -29,7 +29,7 @@ EOF
     apt-get install -y --no-install-recommends supervisor iproute2 iputils-ping ethtool ebtables kmod
     apt-get install -y --no-install-recommends kubelet=1.14.1-00 kubectl=1.14.1-00 kubeadm=1.14.1-00
     apt-get install -y --no-install-recommends squashfs-tools libssl-dev uuid-dev libseccomp-dev libseccomp2
-    apt-get install -y --no-install-recommends gcc make git pkg-config less
+    apt-get install -y --no-install-recommends gcc make git pkg-config less cryptsetup
 
     rm -rf /var/log/*
 
@@ -132,7 +132,7 @@ EOF
     mkdir -p /opt/gopath
     cd /opt
 
-    git clone https://github.com/sylabs/singularity-cri -b v1.0.0-beta.5
+    git clone https://github.com/sylabs/singularity-cri -b v1.0.0-beta.6
     git clone https://github.com/sylabs/singularity -b v3.4.0
 
     export HOME=/tmp
