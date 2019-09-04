@@ -132,8 +132,8 @@ EOF
     mkdir -p /opt/gopath
     cd /opt
 
-    git clone https://github.com/sylabs/singularity-cri -b v1.0.0-beta.2
-    git clone https://github.com/sylabs/singularity -b v3.3.0-rc.1
+    git clone https://github.com/sylabs/singularity-cri -b v1.0.0-beta.5
+    git clone https://github.com/sylabs/singularity -b v3.4.0
 
     export HOME=/tmp
 
