@@ -133,7 +133,7 @@ EOF
     cd /opt
 
     git clone https://github.com/sylabs/singularity-cri -b v1.0.0-beta.6
-    git clone https://github.com/sylabs/singularity -b v3.4.0
+    git clone https://github.com/sylabs/singularity -b v3.4.1
 
     export HOME=/tmp
 
