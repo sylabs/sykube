@@ -80,19 +80,16 @@ jobs:
             echo $CLOUD_AUTH_TOKEN > token
             singularity remote login --tokenfile token SylabsCloud
             echo $SYLABS_PRIVKEY_BASE64 | base64 -d - > key
-            cat > import_sign.cmd <<EOF
+            cat > import_key.cmd <<EOF
             #!/usr/bin/expect -f
             set timeout -1
             spawn singularity keys import key
             expect "Enter your key password : "
             send -- "\r"
             expect eof
-            spawn singularity sign sykube.sif
-            expect "Enter key passphrase : "
-            send -- "\r"
-            expect eof
             EOF
-            expect import_sign.cmd
+            expect import_key.cmd
+            singularity sign sykube.sif
             singularity push sykube.sif library://library/default/sykube:$TAG
 
 workflows:
