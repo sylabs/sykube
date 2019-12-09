@@ -31,6 +31,8 @@ NODE_PREFIX="sykube-node"
 NETWORK_CONF_DIR="/usr/local/etc/singularity/network"
 NETWORK_CONF_FILE="99_sykube.conflist"
 
+DASHBOARD_URL="http://localhost:8001/api/v1/namespaces/kubernetes-dashboard/services/https:kubernetes-dashboard:/proxy/"
+
 SINGULARITY_OPTIONS=""
 
 if [ -f "${SYKUBE_BOOTSTRAP_FILE}" ]; then
@@ -262,7 +264,7 @@ bootstrap_master() {
     print_cmd "Install flannel" singularity exec instance://${MASTER_NAME} kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml
     print_cmd "Create admin-user" singularity exec instance://${MASTER_NAME} kubectl apply -f /etc/sykube/admin-user.yml
     print_cmd "Create admin_user role" singularity exec instance://${MASTER_NAME} kubectl apply -f /etc/sykube/admin-role.yml
-    print_cmd "Install dashboard" singularity exec instance://${MASTER_NAME} kubectl apply -f https://raw.githubusercontent.com/kubernetes/dashboard/v1.10.1/src/deploy/recommended/kubernetes-dashboard.yaml
+    print_cmd "Install dashboard" singularity exec instance://${MASTER_NAME} kubectl apply -f https://raw.githubusercontent.com/kubernetes/dashboard/v2.0.0-beta8/aio/deploy/recommended.yaml
     print_cmd "Waiting flannel and dashboard services" wait_services
     print_cmd "Enabling kube-proxy service" singularity exec instance://${MASTER_NAME} service-sup enable kube-proxy
     NODE_JOIN_CMD=`singularity -s exec instance://${MASTER_NAME} kubeadm token create --print-join-command 2>/dev/null`
@@ -465,10 +467,10 @@ sykube_dashboard() {
     if [ -z "${token}" ]; then
         fatal "Failed to get dashboard token"
     fi
-    echo "\nDahsboard URL:\n\nhttp://localhost:8001/api/v1/namespaces/kube-system/services/https:kubernetes-dashboard:/proxy/\n"
+    echo "\nDahsboard URL:\n\n${DASHBOARD_URL}\n"
     xdg=`which xdg-open 2>/dev/null`
     if [ -n "${xdg}" ]; then
-        ${xdg} http://localhost:8001/api/v1/namespaces/kube-system/services/https:kubernetes-dashboard:/proxy/ 2>/dev/null &
+        ${xdg} ${DASHBOARD_URL} 2>/dev/null &
     fi
     echo "Token:\n"
     echo "${token}\n" && echo "${token}" | xclip -l 1 -selection c 2>/dev/null
